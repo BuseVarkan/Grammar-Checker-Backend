@@ -1,55 +1,74 @@
-import json
 import pytest
+import os
+import time
 from fastapi.testclient import TestClient
-from unittest.mock import patch
-from app import app
+from app import app, tasks
+from uuid import UUID
+from config.api_keys import OPENAI_API_KEY
 
 client = TestClient(app)
 
-@pytest.fixture
-def mock_openai_response():
-    mock_response = [
-        {
-            "wrong_sentence": "He are going to the store.",
-            "corrected_sentence": "He is going to the store.",
-            "error_type": "Subject-Verb Agreement"
-        },
-        {
-            "wrong_sentence": "She walk to school everyday.",
-            "corrected_sentence": "She walks to school every day.",
-            "error_type": "Subject-Verb Agreement"
-        }
-    ]
-    return json.dumps(mock_response)
+@pytest.fixture(scope="session")
+def openai_api_key():
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable not set.")
 
+def test_grammar_check_with_actual_openai():
 
-@patch("app.openai.chat.completions.create")
-def test_grammar_check(mock_chat_completion, mock_openai_response):
-    mock_chat_completion.return_value = type(
-        "MockResponse",
-        (object,),
-        {
-            "choices": [
-                type("MockChoice", (object,), {"message": type("MockMessage", (object,), {"content": mock_openai_response})()})
-            ]
-        }
-    )()
-
-    payload = {"text": "He are going to the store. She walk to school everyday."}
-
+    payload = {
+        "text": "He are going to the store. She walk to school everyday."
+    }
+    
     response = client.post("/grammar-check", json=payload)
-
+    
     assert response.status_code == 200, f"Expected 200, got {response.status_code}"
-
     data = response.json()
-    assert isinstance(data, list), "Expected a list of grammar suggestions."
+    
+    assert "task_id" in data, "Response should contain a task ID."
+    assert data["status"] == "pending", "Task status should be 'pending' initially."
+    assert "message" in data, "Response should contain a message."
+    
+    task_id = data["task_id"]
+    
+    try:
+        UUID(task_id, version=4)
+    except ValueError:
+        pytest.fail("task_id is not a valid UUID.")
+    
+    max_poll_attempts = 10
+    poll_interval = 2  # seconds
 
-    assert len(data) == 3, f"Expected 3 corrections, got {len(data)}."
+    # to ensure that the background task has enough time to complete
+    for attempt in range(max_poll_attempts):
+        status_response = client.get(f"/grammar-check/status/{task_id}")
+        assert status_response.status_code == 200, f"Expected 200, got {status_response.status_code}"
+        status_data = status_response.json()
+        
+        status = status_data.get("status")
+        if status == "completed":
+            break
+        elif status == "failed":
+            pytest.fail(f"Task failed with error: {status_data.get('error')}")
+        else:
+            time.sleep(poll_interval)
+    else:
+        pytest.fail("Task did not complete within the expected time.")
+    
+    assert "result" in status_data, "Completed task should contain a 'result'."
+    assert isinstance(status_data["result"], list), "Result should be a list of grammar suggestions."
+    assert len(status_data["result"]) > 0, "Result list should not be empty."
+    
+    first_correction = status_data["result"][0]
+    assert "wrong_sentence" in first_correction, "Missing 'wrong_sentence' in response."
+    assert "corrected_sentence" in first_correction, "Missing 'corrected_sentence' in response."
+    assert "error_type" in first_correction, "Missing 'error_type' in response."
+    
+    assert first_correction["wrong_sentence"] == "He are going to the store."
+    assert first_correction["corrected_sentence"] == "He is going to the store."
+    assert first_correction["error_type"] == "Subject-verb agreement"
 
-    assert "wrong_sentence" in data[0], "Missing 'wrong_sentence' in response."
-    assert "corrected_sentence" in data[0], "Missing 'corrected_sentence' in response."
-    assert "error_type" in data[0], "Missing 'error_type' in response."
+    second_correction = status_data["result"][1]
+    assert second_correction["wrong_sentence"] == "She walk to school everyday."
+    assert second_correction["corrected_sentence"] == "She walks to school every day."
+    assert second_correction["error_type"] == "Subject-verb agreement"
 
-    assert data[0]["wrong_sentence"] == "He are going to the store."
-    assert data[0]["corrected_sentence"] == "He is going to the store."
-    assert data[0]["error_type"] == "Subject-verb agreement"
