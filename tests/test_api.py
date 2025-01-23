@@ -12,6 +12,7 @@ client = TestClient(app)
 def openai_api_key():
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY environment variable not set.")
+    return ""
 
 def test_grammar_check_with_actual_openai():
 
